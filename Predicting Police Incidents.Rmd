@@ -1,0 +1,281 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+Using the publically available data on police incidents in Hartford (https://data.hartford.gov/Public-Safety/Police-Incidents-01012005-to-Current/889t-nwfu) predicting the possible incidents based on ~0.5M rows.
+
+Note: This analysis is based on similar analysis by Max Woolf (@minimaxir)
+
+## Setting up packages
+
+```{r}
+library(lightgbm)
+library(Matrix)
+library(caret)
+library(viridis)
+library(ggmap)
+library(randomcoloR)
+library(dplyr)
+
+```
+## Loading data 
+
+Importing the data and randomizing it
+
+```{r}
+df = read.csv ("C:/Users/Niharika/Desktop/Police Incidents Prediction/police_incidents.csv")
+df = df[,2:7]
+set.seed(123)
+df <- df %>% sample_frac()
+df %>% head()
+
+
+```
+## Feature Engineering
+# Creating time based features - Year, Month, Hour
+
+```{r}
+df <- df %>% mutate(month = substring(Date, 1, regexpr('/', Date)-1),
+                    hour = substring(Time, 1, regexpr(':', Time)-1),
+                    year = as.numeric(substring(Date, (nchar(as.character(Date))- 3),nchar(as.character(Date)))))
+df %>% head()
+```
+
+## Changing day of the week to factor and also encoding the order
+
+```{r}
+dow_order <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+df <- df %>%
+        mutate(DayOfWeek = factor(DayOfWeek, levels=dow_order))
+df %>% select(DayOfWeek) %>% head()
+```
+Mapping category to index starting with 0
+
+```{r}
+df <- df %>%
+        mutate(category_index = as.numeric(factor(Category)) - 1)
+df %>% select(category_index, Category) %>% head()
+```
+## Training lightgbm model
+
+Using caret to split into train/test to ensure balanced distribution of categories between test and train
+
+```{r}
+# declare categorical feature names
+categoricals <- NULL
+# proportion of data to train on
+split <- 0.7
+set.seed(123)
+trainIndex <- createDataPartition(df$category_index, p= split, list = FALSE, times = 1)
+dtrain <- lgb.Dataset((df %>% select(X, Y, hour, month, year, DayOfWeek) %>% data.matrix())[trainIndex,],
+                     colnames = c("X", "Y", "hour", "month", "year", "DayOfWeek"),
+                     categorical_feature = categoricals,
+                     label = df$category_index[trainIndex], free_raw_data=T)
+dtest <- lgb.Dataset.create.valid(dtrain,
+                                  (df %>% select(X, Y, hour, month, year, DayOfWeek) %>% data.matrix())[-trainIndex,],
+                                  label = df$category_index[-trainIndex])
+params <- list(objective = "multiclass", metric = "multi_logloss")
+valids <- list(test=dtest)
+num_classes <- length(unique(df$category_index))
+
+# preformatting sizes for use in data visualizations later
+train_size_format <- length(trainIndex) %>% format(big.mark=",")
+test_size_format <- (df %>% nrow() - length(trainIndex)) %>% format(big.mark=",")
+
+```
+
+
+
+```{r}
+
+#Training the model on train dataset
+bst <- lgb.train(params,
+                dtrain,
+                nrounds = 500,
+                valids,
+                num_threads = 4,
+                num_class = num_classes,
+                verbose = 0,
+                record = T,
+                early_stopping_rounds = 5,
+                categorical_feature = categoricals
+                )
+
+# multilogloss of final iteration on train
+paste("# Rounds:", bst$current_iter())
+paste("Multilogloss of best model:", bst$record_evals$test$multi_logloss$eval %>% unlist() %>% tail(1))
+
+#calculating variable importance
+df_imp <- tbl_df(lgb.importance(bst, percentage = TRUE))
+df_imp
+
+
+#running the model on test
+test <- (df %>% select(X, Y, hour, month, year, DayOfWeek) %>% data.matrix())[-trainIndex,]
+preds_matrix <- predict(bst, test, reshape=T)
+preds_cor <- cor(preds_matrix)
+results <- t(apply(preds_matrix, 1, function (x) {
+  max_index = which(x==max(x))
+  return (c(max_index-1, x[max_index]))
+}))
+
+
+df_results <- data.frame(results, label_act = df$category_index[-trainIndex]) %>%
+                tbl_df() %>%
+                transmute(label_pred = X1, prod_pred = X2, label_act)
+
+rm(preds_matrix)
+
+
+```
+
+
+Building the confusion matrix
+
+
+```{r}
+cm <- confusionMatrix(df_results$label_pred, df_results$label_act)
+data.frame(cm$overall)
+
+```
+##Visualizations
+
+Importance Bars
+
+```{r}
+df_imp$Feature <- factor(df_imp$Feature, levels = rev(df_imp$Feature))
+
+plot <- ggplot(df_imp, aes(x=Feature, y=Gain)) +
+          geom_bar(stat="identity", fill="#34495e", alpha=0.9) +
+          geom_text(aes(label=sprintf("%0.1f%%", Gain*100)), color="#34495e", hjust=-0.25,family = "Times" ,size=2.5) +
+          fte_theme() +
+          coord_flip() +
+          scale_y_continuous(limits = c(0, 0.4), labels=percent) +
+   theme(plot.title=element_text(hjust=0.5), axis.title.y=element_blank()) +
+          labs(title="Feature Importance for Hartford Arrest Type Model", y="% of Total Gain in LightGBM Model")
+
+plot
+
+```
+Cofusion Matrix
+
+```{r}
+df_cm <- tbl_df(data.frame(cm$table))
+#creating mapping
+df_labels <- df %>%
+              select(category_index, Category) %>%
+              group_by(category_index, Category) %>%
+              summarize() %>%
+              ungroup() %>%
+              mutate(category_index = factor(category_index))
+df_cm <- df_cm %>%
+                left_join(df_labels, by = c("Prediction" = "category_index")) %>%
+                left_join(df_labels, by = c("Reference" = "category_index")) %>%
+                rename(label_pred = Category.x, label_act = Category.y)
+
+df_correct <- df_cm %>% filter(label_pred == label_act)
+plot <- ggplot(df_cm, aes(x=label_act, y=label_pred, fill = Freq)) +
+          geom_tile() +
+          geom_point(data=df_correct, color="white", size=0.8) +
+          fte_theme() +
+          coord_equal() +
+          scale_x_discrete() +
+          scale_y_discrete() +
+          theme(legend.title = element_text(size=7, family="Open Sans Condensed Bold"), legend.position="top", legend.direction="horizontal", legend.key.width=unit(1.25, "cm"), legend.key.height=unit(0.25, "cm"), legend.margin=unit(0,"cm"), axis.text.x=element_text(angle=-90, size=6, vjust=0.5, hjust=0), axis.text.y=element_text(size=6), plot.title = element_text(hjust=1)) +
+            scale_fill_viridis(name="# of Preds", labels=comma, breaks=10^(0:4), trans="log10") +
+            labs(title = sprintf("Confusion Matrix between %s Predicted HPD Arrest Labels and Actual", test_size_format),
+                 x = "Actual Label of Arrest",
+                 y = "Predicted Label of Arrest")
+
+plot
+```
+Correlations
+
+
+
+```{r}
+dd <- as.dist((1-preds_cor)/2)
+hc <- hclust(dd, "centroid")
+label_order <- hc$order
+preds_cor_reorder <- preds_cor[label_order, label_order]
+df_corr <- tbl_df(data.frame(Var1=c(row(preds_cor_reorder))-1, Var2=c(col(preds_cor_reorder))-1, value = c(preds_cor_reorder))) %>%
+            filter(Var1 <= Var2) %>%
+            mutate(Var1 = factor(Var1), Var2=factor(Var2))
+df_corr <- df_corr %>%
+                left_join(df_labels, by = c("Var1" = "category_index")) %>%
+                left_join(df_labels, by = c("Var2" = "category_index")) %>%
+                mutate(label1 = factor(Category.x), label2 = factor(Category.y))
+# fix the label order to the reordered order from the hclust
+levels(df_corr$label1) <- levels(df_corr$label1)[label_order]
+levels(df_corr$label2) <- levels(df_corr$label2)[label_order]
+plot <- ggplot(df_corr, aes(x=label1, y=label2, fill=value)) +
+          geom_tile() +
+          fte_theme() +
+          scale_x_discrete() +
+          scale_y_discrete() +
+          coord_fixed() +
+          theme(legend.title = element_text(size=7, family="Open Sans Condensed Bold"), legend.position="top", legend.direction="horizontal", legend.key.width=unit(1.25, "cm"), legend.key.height=unit(0.25, "cm"), legend.margin=unit(0,"cm"), panel.margin=element_blank(), axis.text.x=element_text(angle=-90, vjust=0.5, hjust=0), axis.title.y=element_blank(), axis.title.x=element_blank(), plot.title=element_text(hjust=1, size=6)) +
+            scale_fill_gradient2(high = "#2ecc71", low = "#e74c3c", mid = "white", 
+   midpoint = 0, limit = c(-0.5,0.5), 
+   name="Pearson\nCorrelation", breaks=pretty_breaks(8))  +
+            labs(title = sprintf("Correlations between Predicted Multiclass Probabilities of %s HPD Arrest Category Labels", test_size_format))
+
+plot
+
+```
+
+
+
+```{r}
+bbox = c(-72.71864705,41.72214158,-72.64828835,41.80743325)
+map <- get_map(location = bbox, source = "stamen", maptype = "toner-lite")
+
+grid_size = 50
+df_points <- data.frame(expand.grid(X=seq(bbox[1], bbox[3], length.out=grid_size),
+                                    Y=seq(bbox[2], bbox[4], length.out=grid_size)))
+
+df_points %>% head()
+
+```
+
+Predicting arrest types at each point on December 17 2017 5PM
+
+```{r}
+date_target <- as.POSIXct("2018-10-28 15:00:00")
+df_points <- df_points %>%
+              mutate(hour = format(date_target, "%H"),
+                    month = format(date_target, "%m"),
+                    year = format(date_target, "%Y"),
+                    DayOfWeek = which(levels(df$DayOfWeek) == format(date_target, "%A"))) %>%
+            data.matrix()
+
+preds_matrix <- matrix(predict(bst, df_points), byrow=T, nrow(df_points), num_classes)
+results <- t(apply(preds_matrix, 1, function (x) {
+  max_index = which(x==max(x))
+  return (c(max_index-1, x[max_index]))
+}))
+rm(preds_matrix)
+
+df_results <- data.frame(X=df_points[,1], Y=df_points[,2], label=factor(results[,1]), prob=results[,2]) %>%
+                tbl_df() %>%
+                left_join(df_labels, by=c("label" = "category_index")) %>%
+                mutate(Category = factor(Category))
+
+
+plot <- ggmap(map) +
+            geom_raster(data = df_results %>% filter(Category != "Other Offenses"), aes(x=X, y=Y, fill=Category), alpha=0.8, size=0) +
+            coord_cartesian() +
+            fte_theme() +
+            scale_fill_brewer(palette = "Dark2") +
+            theme(axis.text.x = element_blank(), axis.text.y = element_blank(), axis.title.x = element_blank(), axis.title.y = element_blank()) +
+            theme(legend.title = element_text(size=7, family="Open Sans Condensed Bold"), legend.position="right", legend.key.width=unit(0.5, "cm"), legend.key.height=unit(2, "cm"), legend.margin=margin(1,0,1,0), plot.title=element_text(hjust=0, size=11)) +
+            labs(title = sprintf("Locations of Predicted Types of Arrests in Hartford on %s",
+                 format(date_target, '%B %d, %Y at%l %p')))
+
+plot
+```
